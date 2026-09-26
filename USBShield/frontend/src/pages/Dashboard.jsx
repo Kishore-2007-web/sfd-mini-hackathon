@@ -17,11 +17,14 @@ export default function Dashboard() {
   const [scanState, setScanState] = useState('IDLE');
   const [scanStage, setScanStage] = useState(0);
 
-  const prevConnectedRef = useRef(false);
+  // Track the specific drive currently scanned so scan sequence runs EXACTLY ONCE per insertion
+  const scannedDriveRef = useRef(null);
+  const isScanningSequenceRunning = useRef(false);
   const scanningTimerRef = useRef(null);
 
   // Trigger 1.2-1.5s visual scanning sequence
   const runScanningSequence = (onComplete) => {
+    isScanningSequenceRunning.current = true;
     setScanState('DETECTING');
     setScanStage(1);
 
@@ -40,6 +43,7 @@ export default function Dashboard() {
     scanningTimerRef.current = setTimeout(() => {
       setScanState('RESULT');
       setScanStage(4);
+      isScanningSequenceRunning.current = false;
       if (onComplete) onComplete();
     }, 1300);
   };
@@ -59,19 +63,22 @@ export default function Dashboard() {
       }
 
       const isConnected = data.connected;
+      const currentDrive = data.device?.drive || (isConnected ? 'ACTIVE_USB' : null);
 
-      // USB Insertion Detection: Transition from disconnected to connected
-      if (isConnected && !prevConnectedRef.current) {
-        prevConnectedRef.current = true;
-        runScanningSequence();
-      } else if (!isConnected) {
-        prevConnectedRef.current = false;
+      if (!isConnected) {
+        // USB removed -> reset to IDLE state immediately
+        scannedDriveRef.current = null;
+        isScanningSequenceRunning.current = false;
         setScanState('IDLE');
         setScanStage(0);
-      } else if (scanState === 'IDLE' && isConnected) {
-        // Fallback for initial load when USB is already plugged in
-        prevConnectedRef.current = true;
+      } else if (isConnected && scannedDriveRef.current !== currentDrive && !isScanningSequenceRunning.current) {
+        // New USB inserted -> Run scanning sequence EXACTLY ONCE
+        scannedDriveRef.current = currentDrive;
         runScanningSequence();
+      } else if (isConnected && !isScanningSequenceRunning.current && scanState !== 'RESULT') {
+        // Ensure completed scan stays on RESULT
+        setScanState('RESULT');
+        setScanStage(4);
       }
     } catch (err) {
       console.error("Poll status error:", err);
@@ -82,6 +89,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
+    // Background status polling every 1.5s (updates data quietly without re-triggering scanning sequence)
     const interval = setInterval(loadData, 1500);
     return () => {
       clearInterval(interval);
@@ -100,6 +108,7 @@ export default function Dashboard() {
 
   const handleToggleDemo = async (newMode) => {
     setDemoModeState(newMode);
+    scannedDriveRef.current = null; // Reset to allow demo drive scan
     runScanningSequence(async () => {
       try {
         await setDemoMode(newMode);
