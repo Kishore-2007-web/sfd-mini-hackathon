@@ -1,59 +1,71 @@
-import subprocess
-import json
+import ctypes
+import os
 import psutil
+
+DRIVE_REMOVABLE = 2
 
 def detect_windows_removable_drives():
     """
-    Detect ONLY genuine removable USB drives on Windows.
-    DriveType=2 represents Removable Storage in Win32_LogicalDisk.
-    Fixed local hard drives (DriveType=3, e.g., C:, D:, E:) are strictly ignored.
+    Detect ONLY genuine removable USB drives on Windows using fast native Win32 API calls.
+    DriveType=2 represents Removable Storage (DRIVE_REMOVABLE).
+    Fixed local hard drives (DriveType=3, e.g., C:, D:) are strictly ignored.
     """
     drives = []
     
-    # 1. Primary Method: PowerShell CIM Win32_LogicalDisk (DriveType=2)
-    try:
-        ps_script = 'Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2" | Select-Object DeviceID, VolumeName, FileSystem, Size, FreeSpace | ConvertTo-Json'
-        cmd = ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps_script]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        stdout = result.stdout.strip()
-        
-        if stdout:
-            parsed = json.loads(stdout)
-            items = parsed if isinstance(parsed, list) else [parsed]
+    # 1. Primary Method: Native Win32 API (ultra-fast, zero subprocess overhead)
+    if os.name == 'nt':
+        try:
+            kernel32 = ctypes.windll.kernel32
+            buf = ctypes.create_unicode_buffer(1024)
+            length = kernel32.GetLogicalDriveStringsW(1024, buf)
             
-            for item in items:
-                drive_id = item.get("DeviceID", "").strip()
-                if not drive_id:
-                    continue
-                
-                drive_letter = drive_id.rstrip('\\')
-                total_bytes = int(item.get("Size") or 0)
-                
-                # Only include drives that have valid mounted size (prevents empty card readers)
-                if total_bytes > 0:
-                    label = item.get("VolumeName") or "Removable USB Disk"
-                    filesystem = item.get("FileSystem") or "FAT32"
-                    free_bytes = int(item.get("FreeSpace") or 0)
-                    
-                    drives.append({
-                        "drive": drive_letter,
-                        "label": label,
-                        "filesystem": filesystem,
-                        "total_bytes": total_bytes,
-                        "free_bytes": free_bytes
-                    })
-            
-            # If CIM returned a valid list (even empty []), return it directly!
-            return drives
-    except Exception as e:
-        print(f"[WindowsDetector] PowerShell DriveType=2 detection failed: {e}")
+            if length > 0:
+                raw_drives = [d for d in buf.value.split('\x00') if d]
+                for raw_drive in raw_drives:
+                    drive_type = kernel32.GetDriveTypeW(raw_drive)
+                    if drive_type == DRIVE_REMOVABLE:
+                        drive_letter = raw_drive.rstrip('\\')
+                        
+                        free_bytes = ctypes.c_ulonglong(0)
+                        total_bytes = ctypes.c_ulonglong(0)
+                        total_free = ctypes.c_ulonglong(0)
+                        
+                        res = kernel32.GetDiskFreeSpaceExW(
+                            raw_drive,
+                            ctypes.byref(free_bytes),
+                            ctypes.byref(total_bytes),
+                            ctypes.byref(total_free)
+                        )
+                        
+                        # Only include mounted removable drives with valid capacity
+                        if res and total_bytes.value > 0:
+                            vol_buf = ctypes.create_unicode_buffer(1024)
+                            fs_buf = ctypes.create_unicode_buffer(1024)
+                            kernel32.GetVolumeInformationW(
+                                raw_drive,
+                                vol_buf, 1024,
+                                None, None, None,
+                                fs_buf, 1024
+                            )
+                            
+                            label = vol_buf.value if vol_buf.value else "Removable USB Disk"
+                            filesystem = fs_buf.value if fs_buf.value else "FAT32"
+                            
+                            drives.append({
+                                "drive": drive_letter,
+                                "label": label,
+                                "filesystem": filesystem,
+                                "total_bytes": total_bytes.value,
+                                "free_bytes": free_bytes.value
+                            })
+                return drives
+        except Exception as e:
+            print(f"[WindowsDetector] Native Win32 API detection failed: {e}")
 
     # 2. Fallback Method: psutil disk_partitions (STRICT 'removable' check)
     try:
         partitions = psutil.disk_partitions(all=False)
         for part in partitions:
-            # STRICT CHECK: Must have 'removable' in opts
             opts = part.opts.lower()
             if 'removable' in opts:
                 drive_letter = part.mountpoint.rstrip('\\')
@@ -73,3 +85,4 @@ def detect_windows_removable_drives():
         print(f"[WindowsDetector] psutil fallback failed: {e}")
         
     return drives
+
