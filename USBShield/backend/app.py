@@ -1,5 +1,6 @@
 import sys
 import datetime
+import time
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -16,12 +17,15 @@ from event_logger import event_logger
 app = Flask(__name__)
 CORS(app)
 
-# Track previous state for event triggering
+# Track previous state for event triggering and scan caching
 state_tracker = {
     "last_connected_drive": None,
     "last_trust_status": None,
     "last_file_count": -1,
-    "demo_mode": "none"  # "none", "simulate_empty", "simulate_filed"
+    "demo_mode": "none",  # "none", "simulate_empty", "simulate_filed"
+    "cached_scan_res": None,
+    "cached_drive": None,
+    "last_scan_time": 0
 }
 
 def get_demo_drive():
@@ -148,15 +152,20 @@ def get_demo_scan(mode):
         }
     return None
 
-def perform_system_status():
+def perform_system_status(force_rescan: bool = False):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_ts = time.time()
     
     # 1. Check for connected drives
     demo_drives = get_demo_drive()
     if demo_drives:
         drives = demo_drives
     else:
-        drives = get_connected_drives()
+        try:
+            drives = get_connected_drives()
+        except Exception as e:
+            print(f"[Backend Error] USB detection failed: {e}")
+            drives = []
         
     if not drives:
         # Check if USB was previously connected and now removed
@@ -172,6 +181,8 @@ def perform_system_status():
             state_tracker["last_connected_drive"] = None
             state_tracker["last_trust_status"] = None
             state_tracker["last_file_count"] = -1
+            state_tracker["cached_scan_res"] = None
+            state_tracker["cached_drive"] = None
 
         no_device_risk = evaluate_usb_risk(None)
         return {
@@ -190,7 +201,8 @@ def perform_system_status():
     label = active_drive.get("label", "Removable Disk")
     
     # Event: USB_CONNECTED (if new drive detected)
-    if state_tracker["last_connected_drive"] != drive_letter:
+    is_new_drive = (state_tracker["last_connected_drive"] != drive_letter)
+    if is_new_drive:
         event_logger.log_event(
             event_type="USB_CONNECTED",
             drive=drive_letter,
@@ -200,29 +212,66 @@ def perform_system_status():
         )
         state_tracker["last_connected_drive"] = drive_letter
 
-    # 2. Perform file scan
+    # 2. Perform file scan (with smart caching)
     if state_tracker["demo_mode"] != "none":
         scan_res = get_demo_scan(state_tracker["demo_mode"])
     else:
-        scan_res = scan_drive(drive_letter)
+        # Use cached scan if same drive and scan is fresh (< 6 seconds old) and not force_rescan
+        use_cache = (
+            not force_rescan and
+            not is_new_drive and
+            state_tracker["cached_drive"] == drive_letter and
+            state_tracker["cached_scan_res"] is not None and
+            (now_ts - state_tracker["last_scan_time"] < 6)
+        )
+        if use_cache:
+            scan_res = state_tracker["cached_scan_res"]
+        else:
+            try:
+                scan_res = scan_drive(drive_letter)
+                state_tracker["cached_scan_res"] = scan_res
+                state_tracker["cached_drive"] = drive_letter
+                state_tracker["last_scan_time"] = now_ts
+            except Exception as e:
+                print(f"[Backend Error] Scan drive {drive_letter} failed: {e}")
+                scan_res = {
+                    "drive": drive_letter,
+                    "scanned_at": timestamp,
+                    "total_files": 0,
+                    "files": [],
+                    "category_summary": {},
+                    "executables_count": 0,
+                    "scripts_count": 0,
+                    "archives_count": 0,
+                    "hidden_files_count": 0
+                }
         
     file_count = scan_res.get("total_files", 0)
 
     # 3. Activity monitoring comparison
-    activity = activity_monitor.update_and_compare(drive_letter, scan_res)
-    if activity.get("activity_detected"):
-        event_logger.log_event(
-            event_type="ACTIVITY_DETECTED",
-            drive=drive_letter,
-            label=label,
-            file_count=file_count,
-            status="WARNING",
-            details=activity.get("message")
-        )
+    try:
+        activity = activity_monitor.update_and_compare(drive_letter, scan_res)
+        if activity.get("activity_detected"):
+            event_logger.log_event(
+                event_type="ACTIVITY_DETECTED",
+                drive=drive_letter,
+                label=label,
+                file_count=file_count,
+                status="WARNING",
+                details=activity.get("message")
+            )
+    except Exception as e:
+        print(f"[Backend Error] Activity monitor error: {e}")
+        activity = {"activity_detected": False, "message": "Activity monitoring unavailable"}
 
     # 4. Risk engine evaluation
-    risk = evaluate_usb_risk(scan_res, activity)
-    trust_status = risk.get("trust")
+    try:
+        risk = evaluate_usb_risk(scan_res, activity)
+    except Exception as e:
+        print(f"[Backend Error] Risk engine evaluation error: {e}")
+        risk = evaluate_usb_risk(None)
+
+    trust_status = risk.get("trust", "UNTRUSTED")
 
     # Log security events on status change or content discovery
     if state_tracker["last_trust_status"] != trust_status:
@@ -298,7 +347,7 @@ def perform_system_status():
 @app.route("/api/status", methods=["GET"])
 def api_status():
     try:
-        res = perform_system_status()
+        res = perform_system_status(force_rescan=False)
         return jsonify(res), 200
     except Exception as e:
         print(f"[API ERROR] /api/status failed: {e}")
@@ -329,7 +378,7 @@ def api_scan():
             status="IN_PROGRESS",
             details="Manual USB security scan triggered by operator"
         )
-        res = perform_system_status()
+        res = perform_system_status(force_rescan=True)
         if res.get("connected") and res.get("device"):
             event_logger.log_event(
                 event_type="SCAN_COMPLETED",
@@ -349,6 +398,8 @@ def api_demo_mode():
         data = request.get_json() or {}
         mode = data.get("mode", "none")  # "none", "simulate_empty", "simulate_filed"
         state_tracker["demo_mode"] = mode
+        state_tracker["cached_scan_res"] = None
+        state_tracker["cached_drive"] = None
         event_logger.log_event(
             event_type="STATUS_CHANGED",
             status="DEMO",
